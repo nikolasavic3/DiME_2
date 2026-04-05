@@ -1,0 +1,11 @@
+# .gitignore
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+celeba/
+outputs/
+*.png
+*.pt
+.DS_Store
+celeba/
