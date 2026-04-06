@@ -18,7 +18,8 @@ def train(
     lr=1e-4,
     save_path="checkpoints/classifier_smiling.pt",
     img_dir=None,
-    size = 128 if torch.cuda.is_available() else 256
+    size = 128 if torch.cuda.is_available() else 256,
+    num_workers=None,
 ):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else
@@ -37,9 +38,9 @@ def train(
     val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=size, img_dir=img_dir)
 
     if use_cuda:
-        num_workers = min(8, os.cpu_count() or 4)
+        num_workers = min(8, os.cpu_count() or 4) if num_workers is None else num_workers
     else:
-        num_workers = 2
+        num_workers = 2 if num_workers is None else num_workers
     pin_memory = use_cuda
 
     loader_kwargs = {
