@@ -16,6 +16,7 @@ def train(
     batch_size=32,
     lr=1e-4,
     save_path="checkpoints/classifier_smiling.pt",
+    img_dir=None,
 ):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else
