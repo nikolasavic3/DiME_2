@@ -31,7 +31,7 @@ def train(
     train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=size, img_dir=img_dir)
     val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=size, img_dir=img_dir)
 
-    num_workers = 16 if torch.cuda.is_available() else 2
+    num_workers = 4 if torch.cuda.is_available() else 2
     pin_memory = torch.cuda.is_available()  # also fix the MPS warning
 
     train_loader = DataLoader(
