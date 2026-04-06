@@ -14,7 +14,7 @@ def train(
     celeba_root="celeba",
     attr="Smiling",
     epochs=5,
-    batch_size = 128 if torch.cuda.is_available() else 32,
+    batch_size = 512 if torch.cuda.is_available() else 32,
     lr=1e-4,
     save_path="checkpoints/classifier_smiling.pt",
     img_dir=None,
@@ -31,7 +31,7 @@ def train(
     train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=size, img_dir=img_dir)
     val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=size, img_dir=img_dir)
 
-    num_workers = 8 if torch.cuda.is_available() else 2
+    num_workers = 16 if torch.cuda.is_available() else 2
     pin_memory = torch.cuda.is_available()  # also fix the MPS warning
 
     train_loader = DataLoader(
@@ -56,6 +56,8 @@ def train(
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = torch.nn.DataParallel(model)
+        batch_size = batch_size * torch.cuda.device_count()
+
 
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
