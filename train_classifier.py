@@ -7,13 +7,14 @@ from tqdm import tqdm
 
 from dataset import CelebADataset
 from classifier import CelebAClassifier
+from torch.amp import GradScaler, autocast
 
 
 def train(
     celeba_root="celeba",
     attr="Smiling",
     epochs=5,
-    batch_size=32,
+    batch_size = 128 if torch.cuda.is_available() else 32,
     lr=1e-4,
     save_path="checkpoints/classifier_smiling.pt",
     img_dir=None,
@@ -26,8 +27,8 @@ def train(
     print(f"Device: {device}")
 
     # Datasets
-    train_ds = CelebADataset(celeba_root, attr=attr, split="train", img_dir=img_dir)
-    val_ds   = CelebADataset(celeba_root, attr=attr, split="val", img_dir=img_dir)
+    train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=128, img_dir=img_dir)
+    val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=128, img_dir=img_dir)
 
     num_workers = 4 if torch.cuda.is_available() else 2
     pin_memory = torch.cuda.is_available()  # also fix the MPS warning
@@ -54,6 +55,7 @@ def train(
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     best_val_acc = 0.0
 
+    scaler = GradScaler(enabled=torch.cuda.is_available())
     for epoch in range(epochs):
         # --- Train ---
         model.train()
@@ -63,10 +65,12 @@ def train(
             imgs, labels = imgs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+                logits = model(imgs)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item() * imgs.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
