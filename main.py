@@ -79,8 +79,7 @@ if __name__ == "__main__":
 
     print("Loading classifier...")
     classifier = CelebAClassifier(num_classes=2).to(device)
-    # NOTE: random weights for now — swap in trained weights once available
-    # classifier.load_state_dict(torch.load("checkpoints/classifier.pt"))
+    classifier.load_state_dict(torch.load("checkpoints/classifier_smiling.pt", map_location=device))
     classifier.eval()
 
     print("\nGenerating counterfactual...")
