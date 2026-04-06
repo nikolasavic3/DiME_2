@@ -29,19 +29,27 @@ def train(
     train_ds = CelebADataset(celeba_root, attr=attr, split="train", img_dir=img_dir)
     val_ds   = CelebADataset(celeba_root, attr=attr, split="val", img_dir=img_dir)
 
+    num_workers = 4 if torch.cuda.is_available() else 2
+    pin_memory = torch.cuda.is_available()  # also fix the MPS warning
+
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True
+        num_workers=num_workers, pin_memory=pin_memory
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True
+        num_workers=num_workers, pin_memory=pin_memory
     )
 
     # Model
     model = CelebAClassifier(num_classes=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     best_val_acc = 0.0
