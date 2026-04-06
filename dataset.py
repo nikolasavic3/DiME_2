@@ -1,4 +1,5 @@
 # dataset.py
+from logging import root
 import os
 import pandas as pd
 from PIL import Image
@@ -21,9 +22,9 @@ CELEBA_ATTRS = [
 
 class CelebADataset(Dataset):
 
-    def __init__(self, root, attr="Smiling", split="train", size=256):
+    def __init__(self, root, attr="Smiling", split="train", size=256, img_dir=None):
         self.root = root
-        self.img_dir = os.path.join(root, "img_align_celeba")
+        self.img_dir = img_dir if img_dir else os.path.join(root, "img_align_celeba")
 
         # Load attributes — CSV with image_id as index
         attr_path = os.path.join(root, "list_attr_celeba.csv")
