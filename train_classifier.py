@@ -25,55 +25,72 @@ def train(
         "mps" if torch.backends.mps.is_available() else
         "cpu"
     )
+    use_cuda = device.type == "cuda"
+    if use_cuda:
+        # Enable kernel autotuning for fixed-size image workloads.
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     print(f"Device: {device}")
 
     # Datasets
     train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=size, img_dir=img_dir)
     val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=size, img_dir=img_dir)
 
-    num_workers = 4 if torch.cuda.is_available() else 2
-    pin_memory = torch.cuda.is_available()  # also fix the MPS warning
+    if use_cuda:
+        num_workers = min(8, os.cpu_count() or 4)
+    else:
+        num_workers = 2
+    pin_memory = use_cuda
+
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=True,  # keep worker processes alive between epochs
-        prefetch_factor=4,        # each worker prefetches 4 batches ahead
-)
+        **loader_kwargs,
+    )
 
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
-        persistent_workers=True,
-        prefetch_factor=4,
+        **loader_kwargs,
     )
 
     # Model
     model = CelebAClassifier(num_classes=2).to(device)
+    if use_cuda:
+        model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = torch.nn.DataParallel(model)
-        batch_size = batch_size * torch.cuda.device_count()
 
 
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     best_val_acc = 0.0
 
-    scaler = GradScaler(enabled=torch.cuda.is_available())
+    scaler = GradScaler(enabled=use_cuda)
     for epoch in range(epochs):
         # --- Train ---
         model.train()
         total_loss, correct, total = 0.0, 0, 0
 
         for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            imgs, labels = imgs.to(device), labels.to(device)
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            if use_cuda:
+                imgs = imgs.to(memory_format=torch.channels_last)
 
-            optimizer.zero_grad()
-            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
                 logits = model(imgs)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
@@ -93,8 +110,12 @@ def train(
 
         with torch.no_grad():
             for imgs, labels in val_loader:
-                imgs, labels = imgs.to(device), labels.to(device)
-                logits = model(imgs)
+                imgs = imgs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                if use_cuda:
+                    imgs = imgs.to(memory_format=torch.channels_last)
+                with autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
+                    logits = model(imgs)
                 correct += (logits.argmax(1) == labels).sum().item()
                 total += imgs.size(0)
 
@@ -107,7 +128,8 @@ def train(
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), save_path)
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save(state_dict, save_path)
             print(f"  Saved best model  val_acc={val_acc:.4f}")
 
     print(f"\nDone. Best val acc: {best_val_acc:.4f}")
