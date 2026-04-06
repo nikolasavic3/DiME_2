@@ -26,8 +26,8 @@ def train(
     print(f"Device: {device}")
 
     # Datasets
-    train_ds = CelebADataset(celeba_root, attr=attr, split="train")
-    val_ds   = CelebADataset(celeba_root, attr=attr, split="val")
+    train_ds = CelebADataset(celeba_root, attr=attr, split="train", img_dir=img_dir)
+    val_ds   = CelebADataset(celeba_root, attr=attr, split="val", img_dir=img_dir)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
