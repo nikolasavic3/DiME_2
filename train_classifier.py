@@ -18,6 +18,7 @@ def train(
     lr=1e-4,
     save_path="checkpoints/classifier_smiling.pt",
     img_dir=None,
+    size = 128 if torch.cuda.is_available() else 256
 ):
     device = torch.device(
         "cuda" if torch.cuda.is_available() else
@@ -27,19 +28,24 @@ def train(
     print(f"Device: {device}")
 
     # Datasets
-    train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=128, img_dir=img_dir)
-    val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=128, img_dir=img_dir)
+    train_ds = CelebADataset(celeba_root, attr=attr, split="train", size=size, img_dir=img_dir)
+    val_ds   = CelebADataset(celeba_root, attr=attr, split="val",   size=size, img_dir=img_dir)
 
-    num_workers = 4 if torch.cuda.is_available() else 2
+    num_workers = 8 if torch.cuda.is_available() else 2
     pin_memory = torch.cuda.is_available()  # also fix the MPS warning
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory
-    )
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=True,  # keep worker processes alive between epochs
+        prefetch_factor=4,        # each worker prefetches 4 batches ahead
+)
+
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory
+        num_workers=num_workers, pin_memory=pin_memory,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     # Model
