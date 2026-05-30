@@ -102,7 +102,7 @@ if __name__ == "__main__":
         ddpm=ddpm,
         classifier=classifier,
         target_label=target_label,
-        tau=150,
+        tau=60,
         lambda_c_values=(5.0, 8.0, 10.0, 15.0),
         lambda_l1=0.05,
     )

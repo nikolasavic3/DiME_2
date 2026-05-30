@@ -49,30 +49,28 @@ def apply_guidance(x0_hat, grad, lambda_c, mask=None):
     """
     Apply the guidance gradient to x̂₀, optionally masked by a Grad-CAM spatial map.
 
-    Gradient is normalized to unit L2 norm before scaling so that lambda_c
-    is a consistent step size regardless of timestep or gradient magnitude.
-    The Grad-CAM mask then attenuates the step spatially — pixels outside
-    the semantically relevant region (e.g., background, hair) receive a
-    smaller or zero update.
+    The Grad-CAM mask attenuates the gradient spatially so that classifier
+    guidance is concentrated in semantically relevant regions (e.g., mouth for
+    Smiling) while background pixels receive reduced updates.
+
+    The mask is soft: non-masked regions still receive 20% of the gradient
+    so the diffusion process stays globally coherent.
 
     Args:
         x0_hat:   estimated clean image
         grad:     raw gradient from get_guidance_gradient()
-        lambda_c: float, guidance scale (step size)
+        lambda_c: float, guidance scale
         mask:     optional (1, 1, H, W) spatial mask in [0, 1] from Grad-CAM
 
     Returns:
         x0_hat_guided: updated clean image estimate
     """
-    # Normalize gradient to unit L2 norm per sample so lambda_c is scale-invariant
-    grad_norm = grad.view(grad.shape[0], -1).norm(dim=1).view(-1, 1, 1, 1).clamp(min=1e-8)
-    grad_normalized = grad / grad_norm
-
-    # Apply Grad-CAM spatial mask: concentrate changes in semantically relevant regions
     if mask is not None:
-        grad_normalized = grad_normalized * mask.to(grad_normalized.device)
+        # Soft mask: important regions get full gradient, rest get 20%
+        soft_mask = 0.2 + 0.8 * mask.to(grad.device)
+        grad = grad * soft_mask
 
-    x0_hat_guided = x0_hat - lambda_c * grad_normalized
+    x0_hat_guided = x0_hat - lambda_c * grad
     return x0_hat_guided.clamp(-1, 1)
 
 
