@@ -1,4 +1,3 @@
-# guidance.py
 import torch
 import torch.nn.functional as F
 
@@ -19,85 +18,74 @@ def get_guidance_gradient(x0_hat, classifier, target_label, lambda_l1, x_orig):
     original image, preventing unnecessary changes to irrelevant attributes.
 
     Args:
-        x0_hat:       estimated clean image, shape (B, C, H, W), requires_grad
+        x0_hat:       estimated clean image, shape (B, C, H, W)
         classifier:   the model under observation (ResNet-18)
         target_label: int, the attribute class we want to flip toward
-        lambda_l1:    float, weight of the proximity loss (keeps image close to original)
+        lambda_l1:    float, weight of the proximity loss
         x_orig:       the original clean image, used for the proximity loss
 
     Returns:
-        grad: gradient tensor, same shape as x0_hat
+        grad:     raw gradient tensor, same shape as x0_hat
+        ce_loss:  float, classification loss value
+        l1_loss:  float, proximity loss value
     """
-
-    # Make sure gradients can flow through x0_hat
-    # We detach from the diffusion graph and create a fresh leaf
     x0_hat = x0_hat.detach().requires_grad_(True)
+    use_cuda = x0_hat.device.type == "cuda"
 
-    # Forward pass through classifier
-    logits = classifier(x0_hat)                        # (B, num_classes)
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
+        logits = classifier(x0_hat)
 
-    # We want to maximise p(target | x̂₀), which means minimising
-    # the cross-entropy loss toward the target label
-    target = torch.tensor(
-        [target_label] * x0_hat.shape[0],
-        device=x0_hat.device
-    )
+    target = torch.full((x0_hat.shape[0],), target_label, device=x0_hat.device, dtype=torch.long)
     ce_loss = F.cross_entropy(logits, target)
-
-    # L1 proximity: penalise deviation from the original image
-    # This is what keeps the counterfactual close to the input —
-    # we only want to change what's necessary to flip the label
     l1_loss = (x0_hat - x_orig.to(x0_hat.device)).abs().mean()
-
-    # Combined loss
     loss = ce_loss + lambda_l1 * l1_loss
 
-    # Backpropagate to get gradient w.r.t. x̂₀
-    loss.backward()
-
-    grad = x0_hat.grad.detach()
+    grad = torch.autograd.grad(loss, x0_hat, retain_graph=False, create_graph=False)[0].detach()
 
     return grad, ce_loss.item(), l1_loss.item()
 
 
-def apply_guidance(x0_hat, grad, lambda_c):
+def apply_guidance(x0_hat, grad, lambda_c, mask=None):
     """
-    Apply the guidance gradient to x̂₀.
+    Apply the guidance gradient to x̂₀, optionally masked by a Grad-CAM spatial map.
 
-    We subtract the gradient because we're doing gradient descent on the loss
-    (which we want to minimise). This nudges x̂₀ in the direction that makes
-    the classifier more confident about the target label.
+    Gradient is normalized to unit L2 norm before scaling so that lambda_c
+    is a consistent step size regardless of timestep or gradient magnitude.
+    The Grad-CAM mask then attenuates the step spatially — pixels outside
+    the semantically relevant region (e.g., background, hair) receive a
+    smaller or zero update.
 
     Args:
         x0_hat:   estimated clean image
-        grad:     gradient from get_guidance_gradient()
-        lambda_c: float, guidance scale (how hard we push toward target)
+        grad:     raw gradient from get_guidance_gradient()
+        lambda_c: float, guidance scale (step size)
+        mask:     optional (1, 1, H, W) spatial mask in [0, 1] from Grad-CAM
 
     Returns:
-        x0_hat_guided: nudged clean image estimate
+        x0_hat_guided: updated clean image estimate
     """
-    x0_hat_guided = x0_hat - lambda_c * grad
+    # Normalize gradient to unit L2 norm per sample so lambda_c is scale-invariant
+    grad_norm = grad.view(grad.shape[0], -1).norm(dim=1).view(-1, 1, 1, 1).clamp(min=1e-8)
+    grad_normalized = grad / grad_norm
 
-    # Clip to valid image range after nudging
-    x0_hat_guided = x0_hat_guided.clamp(-1, 1)
+    # Apply Grad-CAM spatial mask: concentrate changes in semantically relevant regions
+    if mask is not None:
+        grad_normalized = grad_normalized * mask.to(grad_normalized.device)
 
-    return x0_hat_guided
+    x0_hat_guided = x0_hat - lambda_c * grad_normalized
+    return x0_hat_guided.clamp(-1, 1)
 
 
 def guided_reverse_step(x_t, t, ddpm, classifier, target_label,
-                        lambda_c, lambda_l1, x_orig):
+                        lambda_c, lambda_l1, x_orig, mask=None):
     """
-    One full guided denoising step — this is what gets called in the loop.
+    One full guided denoising step.
 
     Combines:
       1. predict x̂₀ from x_t
-      2. compute and apply guidance gradient to x̂₀
-      3. take the reverse diffusion step using the nudged x̂₀
-
-    The trick for step 3: we can't just pass the nudged x̂₀ directly to
-    reverse_step() because that function re-estimates x̂₀ internally.
-    Instead we reconstruct a "guided x_t" that is consistent with the
-    nudged x̂₀, and pass that to reverse_step().
+      2. compute guidance gradient, normalize, apply Grad-CAM mask, apply step
+      3. reconstruct a guided x_t consistent with the nudged x̂₀
+      4. take the standard reverse diffusion step
 
     Args:
         x_t:          noisy image at timestep t
@@ -105,41 +93,28 @@ def guided_reverse_step(x_t, t, ddpm, classifier, target_label,
         ddpm:         DDPM instance
         classifier:   ResNet-18 under observation
         target_label: int
-        lambda_c:     guidance scale
+        lambda_c:     guidance scale (step size in normalized gradient space)
         lambda_l1:    proximity loss weight
         x_orig:       original clean image
+        mask:         optional Grad-CAM spatial mask, (1, 1, H, W) in [0, 1]
 
     Returns:
-        x_{t-1}:  denoised image for next step
-        info:     dict with loss values for logging
+        x_{t-1}: denoised image for next step
+        info:    dict with loss values for logging
     """
+    x0_hat, eps_hat = ddpm.predict_x0(x_t, t, return_eps=True)
 
-    # Step 1: estimate clean image from current noisy state
-    x0_hat = ddpm.predict_x0(x_t, t)
-
-    # Step 2: compute guidance gradient and apply it
     grad, ce_loss, l1_loss = get_guidance_gradient(
         x0_hat, classifier, target_label, lambda_l1, x_orig
     )
-    x0_hat_guided = apply_guidance(x0_hat, grad, lambda_c)
+    x0_hat_guided = apply_guidance(x0_hat, grad, lambda_c, mask=mask)
 
-    # Step 3: reconstruct a guided x_t consistent with x0_hat_guided
-    # We re-noise x0_hat_guided back to level t, then take the reverse step.
-    # This ensures the reverse step's internal x̂₀ estimate aligns with
-    # the direction we guided it.
-    alpha_prod = ddpm.scheduler.alphas_cumprod[t]
-    sqrt_alpha  = alpha_prod ** 0.5
+    # Reconstruct x_t consistent with the guided x̂₀, then reverse step
+    alpha_prod = ddpm.alphas_cumprod[t]
+    sqrt_alpha = alpha_prod ** 0.5
     sqrt_one_minus = (1 - alpha_prod) ** 0.5
-
-    # Extract the noise that was in x_t
-    with torch.no_grad():
-        t_tensor = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-        eps_hat = ddpm.unet(x_t, t_tensor).sample
-
-    # Reconstruct x_t using the guided x̂₀ and the same noise direction
     x_t_guided = sqrt_alpha * x0_hat_guided + sqrt_one_minus * eps_hat
 
-    # Step 4: standard reverse step from the guided x_t
     x_prev = ddpm.reverse_step(x_t_guided, t)
 
     info = {

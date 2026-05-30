@@ -30,11 +30,12 @@ def to_displayable(tensor):
 
 def save_results(x0, result):
     cf = result["cf"]
+    mask = result.get("mask")
     diff = (cf - x0).abs()
-    # Amplify difference map so subtle changes are visible
     diff_amplified = (diff * 5).clamp(0, 1)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    ncols = 4 if mask is not None else 3
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
 
     axes[0].imshow(to_displayable(x0[0]))
     axes[0].set_title("original")
@@ -48,6 +49,11 @@ def save_results(x0, result):
     axes[2].imshow(to_displayable(diff_amplified[0]))
     axes[2].set_title(f"difference x5  L1={result['l1_dist']:.4f}")
     axes[2].axis("off")
+
+    if mask is not None:
+        axes[3].imshow(mask[0, 0].cpu().numpy(), cmap="hot")
+        axes[3].set_title("Grad-CAM mask")
+        axes[3].axis("off")
 
     plt.tight_layout()
     plt.savefig("result.png", dpi=150)
@@ -69,16 +75,24 @@ if __name__ == "__main__":
         "mps" if torch.backends.mps.is_available() else
         "cpu"
     )
+    use_cuda = device.type == "cuda"
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     print(f"Device: {device}")
 
     print("Loading image...")
-    x0 = load_image(image_path).to(device)
+    x0 = load_image(image_path).to(device, non_blocking=True)
+    if use_cuda:
+        x0 = x0.to(memory_format=torch.channels_last)
 
     print("Loading DDPM...")
     ddpm = DDPM()
 
     print("Loading classifier...")
     classifier = CelebAClassifier(num_classes=2).to(device)
+    if use_cuda:
+        classifier = classifier.to(memory_format=torch.channels_last)
     classifier.load_state_dict(torch.load("checkpoints/classifier_smiling.pt", map_location=device))
     classifier.eval()
 
@@ -88,7 +102,7 @@ if __name__ == "__main__":
         ddpm=ddpm,
         classifier=classifier,
         target_label=target_label,
-        tau=60,
+        tau=150,
         lambda_c_values=(5.0, 8.0, 10.0, 15.0),
         lambda_l1=0.05,
     )
