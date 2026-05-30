@@ -25,6 +25,7 @@ class DDPM:
 
     def __init__(self, model_id="google/ddpm-celebahq-256", timesteps=1000):
         self.device = get_device()
+        self.use_cuda = self.device.type == "cuda"
         print(f"Using device: {self.device}")
 
         # The scheduler holds the noise schedule: all the alphas, betas,
@@ -35,11 +36,23 @@ class DDPM:
         # Override total timesteps if needed
         self.scheduler.set_timesteps(timesteps)
         self.T = timesteps
+        self.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+        self._timestep_cache = {}
 
         # The UNet: takes (noisy_image, timestep) → predicted noise
         self.unet = UNet2DModel.from_pretrained(model_id)
         self.unet = self.unet.to(self.device)
+        if self.use_cuda:
+            self.unet = self.unet.to(memory_format=torch.channels_last)
         self.unet.eval()  # we never train this
+
+    def _get_t_tensor(self, t, batch_size, device):
+        key = (int(t), int(batch_size), device.type, device.index)
+        t_tensor = self._timestep_cache.get(key)
+        if t_tensor is None:
+            t_tensor = torch.full((batch_size,), int(t), device=device, dtype=torch.long)
+            self._timestep_cache[key] = t_tensor
+        return t_tensor
 
     def forward(self, x0, t):
         """
@@ -59,20 +72,22 @@ class DDPM:
             x_t: noisy image at level t, same shape as x0
             noise: the noise that was added (we'll need this later)
         """
-        x0 = x0.to(self.device)
+        x0 = x0.to(self.device, non_blocking=True)
+        if self.use_cuda:
+            x0 = x0.to(memory_format=torch.channels_last)
 
         # Sample noise
         noise = torch.randn_like(x0)
 
         # t needs to be a tensor of shape (B,) for the scheduler
-        t_tensor = torch.tensor([t] * x0.shape[0], device=self.device)
+        t_tensor = self._get_t_tensor(t, x0.shape[0], x0.device)
 
         # The scheduler computes sqrt(ᾱ_t) and sqrt(1-ᾱ_t) for us
         x_t = self.scheduler.add_noise(x0, noise, t_tensor)
 
         return x_t, noise
 
-    def predict_x0(self, x_t, t):
+    def predict_x0(self, x_t, t, return_eps=False):
         """
         Given noisy image x_t at timestep t, estimate the clean image x̂₀.
 
@@ -92,16 +107,19 @@ class DDPM:
         Returns:
             x0_hat: estimated clean image, shape (B, C, H, W)
         """
-        x_t = x_t.to(self.device)
-        t_tensor = torch.tensor([t] * x_t.shape[0], device=self.device)
+        x_t = x_t.to(self.device, non_blocking=True)
+        if self.use_cuda:
+            x_t = x_t.to(memory_format=torch.channels_last)
+        t_tensor = self._get_t_tensor(t, x_t.shape[0], x_t.device)
 
         with torch.no_grad():
             # UNet predicts the noise component ε̂
-            eps_hat = self.unet(x_t, t_tensor).sample
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_cuda):
+                eps_hat = self.unet(x_t, t_tensor).sample
 
         # Retrieve precomputed schedule values for this timestep
         # These are cumulative products: ᾱ_t
-        alpha_prod = self.scheduler.alphas_cumprod[t]
+        alpha_prod = self.alphas_cumprod[t]
         sqrt_alpha_prod     = alpha_prod ** 0.5
         sqrt_one_minus_alpha = (1 - alpha_prod) ** 0.5
 
@@ -111,9 +129,11 @@ class DDPM:
         # Clip to valid image range — the estimate can drift outside [-1,1]
         x0_hat = x0_hat.clamp(-1, 1)
 
+        if return_eps:
+            return x0_hat, eps_hat
         return x0_hat
 
-    def reverse_step(self, x_t, t):
+    def reverse_step(self, x_t, t, eps_hat=None):
         """
         Take one denoising step: x_t → x_{t-1}.
 
@@ -128,11 +148,15 @@ class DDPM:
         Returns:
             x_{t-1}: slightly less noisy image
         """
-        x_t = x_t.to(self.device)
-        t_tensor = torch.tensor([t] * x_t.shape[0], device=self.device)
+        x_t = x_t.to(self.device, non_blocking=True)
+        if self.use_cuda:
+            x_t = x_t.to(memory_format=torch.channels_last)
 
-        with torch.no_grad():
-            eps_hat = self.unet(x_t, t_tensor).sample
+        if eps_hat is None:
+            t_tensor = self._get_t_tensor(t, x_t.shape[0], x_t.device)
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_cuda):
+                    eps_hat = self.unet(x_t, t_tensor).sample
 
         # scheduler.step() implements the full DDPM reverse formula:
         # x_{t-1} = mu(x_t, x̂₀) + sigma_t * z   where z ~ N(0,I)
